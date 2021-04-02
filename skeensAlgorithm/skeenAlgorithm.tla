@@ -6,7 +6,7 @@ CONSTANTS NPROCESS, MESSAGES
 VARIABLES pc, sent, pending, received, lc, messages
 
 ASSUME (NPROCESS \in Nat) /\ (MESSAGES # {})
-ASSUME (NPROCESS > 1)
+ASSUME (NPROCESS >= 2)
 
 vars == << pc, sent, pending, received, lc, messages >>
 
@@ -16,51 +16,57 @@ Init ==
     /\ messages = [i \in Processes |-> MESSAGES]
     /\ pending = [i \in Processes |-> {}]
     /\ received = [i \in Processes |-> {}]
-    /\ sent = [i \in Processes |-> [bcast |-> {}, ts |-> {}, sn |-> {}]]
+    /\ sent = [i \in Processes |-> [bc |-> {}, ts |-> {}, sn |-> {}]]
     /\ pc \in [Processes -> {"BCAST", ""}]
     /\ lc = [i \in Processes |-> 0]
 
+Broadcast(message) == 
+    [i \in Processes |-> [sent[i] EXCEPT !.bc = sent[i].bc \cup {message}]]
+
 UpponBCAST(self) ==
     /\ (pc[self] = "BCAST") /\ (messages[self] # {})
-    /\ LET currentMessage == CHOOSE x \in messages[self]: TRUE
-        IN  /\ sent' = [i \in Processes |-> [sent[self] EXCEPT !.bcast = sent[self].bcast \cup {[source |-> self, message |-> currentMessage]}]]
+    /\ LET  currentMessage == CHOOSE x \in messages[self]: TRUE
+        IN  /\ sent' = Broadcast(<<self, currentMessage>>)
             /\ messages' = [messages EXCEPT ![self] = messages[self] \ {currentMessage}]
             /\ UNCHANGED <<lc, pending, pc, received>>
 
+(* <<TYPE, SOURCE, DESTINATION, MESSAGE_BODY, TIMESTAMP>> *)
+ReceivedMessage(self) ==
+    /\ \E msg \in sent[self].bc:
+        /\ msg \notin pending[self]
+        /\ pending' = [pending EXCEPT ![self] = pending[self] \cup { msg }]
+        /\ sent' = [sent EXCEPT ![msg[1]].ts = sent[msg[1]].ts \cup {<<self, msg[2], lc[self]>>}]
+        /\ UNCHANGED <<received, pc, messages, lc>>
 
-ReceivedBCAST(self) ==
-  /\ pc[self] # "SN"
-  /\ \E m \in sent[self].bcast:
-        /\ m \notin pending[self]
-        /\ pending' = [pending  EXCEPT ![self] = pending[self] \cup {m}]
-        /\ sent' = [sent EXCEPT ![m.source].ts = sent[m.source].ts \cup {[source |-> self, message |-> m.message, ts |-> lc[self]]}] 
-        /\ lc' = [lc EXCEPT ![self] = lc[self] + 1]
-        /\ UNCHANGED <<received, pc, messages>>
+MaxTSAllProcess(S) == (CHOOSE t \in S : \A s \in S : s[3] <= t[3])[3]
 
-MaxTSAllProcess(S) == CHOOSE t \in S : \A s \in S : s.ts <= t.ts
+SN(message) ==
+    [i \in Processes |-> [sent[i] EXCEPT !.sn = sent[i].sn \cup {message}]]
 
-ReceivedTS(self) ==
-    /\ pc[self] # "SN"
-    /\ LET msgs == sent[self].ts
+ReceivedTSFromAll(self) ==
+    /\ LET  msgs == {m1 \in sent[self].ts: \A m2 \in sent[self].ts: m1[2] = m2[2]}
         IN  /\ Cardinality(msgs) = NPROCESS
-            /\ LET maxTS == MaxTSAllProcess(msgs).ts
-                IN  /\ \E m \in msgs:
-                        /\ [source |-> self, message |-> m.message, ts |-> maxTS] \notin sent[self].sn
-                        /\ sent' = [i \in Processes |-> [sent[self] EXCEPT !.sn = sent[self].sn \cup {[source |-> self, message |-> m.message, ts |-> maxTS]}]]
-                        /\ pc' = [pc EXCEPT ![self] = "SN"]
-                        /\ UNCHANGED <<pending, received, lc, messages>>
+            /\ LET m == CHOOSE x \in msgs: TRUE
+                IN  /\ sent' = SN(<<self, m[2], MaxTSAllProcess(msgs)>>)
+                    /\ UNCHANGED <<received, pending, lc, messages, pc>>
+
+ReceivedSN(self) ==
+    /\ \E msg \in sent[self].sn:
+        /\ <<msg[1], msg[2]>> \notin received[self]
+        /\ received' = [received EXCEPT ![self] = received[self] \cup {<<msg[1], msg[2]>>}]
+        /\ UNCHANGED <<sent, pending, lc, messages, pc>>
 
 \* FIX RECEIVED
 Accept(self) ==
-    /\ (Cardinality(MESSAGES) = Cardinality(sent[self].sn))
+    /\ Cardinality(Processes \times MESSAGES) = Cardinality(received[self])
     /\ pc' = [pc EXCEPT ![self] = "AC"]
-    /\ received' = [received EXCEPT ![self] = sent[self].sn]
-    /\ UNCHANGED <<sent, pending, lc, messages>>
+    /\ UNCHANGED  <<sent, pending, lc, messages, received>>
 
 Steps(self) ==
     \/ UpponBCAST(self)
-    \/ ReceivedBCAST(self)
-    \/ ReceivedTS(self)
+    \/ ReceivedMessage(self)
+    \/ ReceivedTSFromAll(self)
+    \/ ReceivedSN(self)
     \/ Accept(self)
     \/ UNCHANGED vars
 
@@ -68,22 +74,22 @@ Next == (\E self \in Processes: Steps(self))
 
 Fairness == WF_vars(Next)
 
-Spec == Init /\ [][Next]_vars
-
+Spec == Init /\ [][Next]_vars /\ Fairness
 
 TypeOK ==
     /\ pc \in [ Processes -> {"BCAST", "SN", "AC", ""} ]
 
 \* Properties
 
-Agreement == []((\A self \in Processes: pc[self] = "AC") => <>(\E self \in Processes: pc[self] = "AC"))
+Agreement == []((\E self \in Processes: pc[self] = "AC") => <>[](\A self \in Processes: pc[self] = "AC"))
 
-\* GetMessage == CHOOSE m \in MESSAGES: TRUE
+SelectedMessage == CHOOSE m \in (Processes \times MESSAGES): TRUE
 
-\* Validity == WF_<<>>(\A p \in Processes: <<p, GetMessage>> \in deliveryBuffer[p])
+Validity == []((\E self \in Processes: SelectedMessage \in sent[self].bc) => <>[](\A p \in Processes: SelectedMessage \in received[p]))
 
-\* Integrity == ()
+Integrity == []((\E self \in Processes: SelectedMessage \in received[self]) => <>[](\A self \in Processes: Cardinality({m \in received[self]: m = SelectedMessage}) = 1))
 
-\* TotalOrder == ()
+\* TotalOrder == 
+
 
 ====
