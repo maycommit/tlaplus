@@ -1,14 +1,11 @@
----- MODULE skeenAlgorithm ----
+---- MODULE SkeenAlgorithm ----
 EXTENDS TLC, Naturals, FiniteSets, Sequences
-
 CONSTANTS NPROCESS, MESSAGES
-
-VARIABLES pc, sent, pending, received, lc, messages
-
+VARIABLES pc, sent, pending, received, messages, lclock
 ASSUME (NPROCESS \in Nat) /\ (MESSAGES # {})
 ASSUME (NPROCESS >= 2)
 
-vars == << pc, sent, pending, received, lc, messages >>
+vars == << pc, sent, pending, received, messages, lclock>>
 
 Processes == 1 .. NPROCESS
 
@@ -16,55 +13,66 @@ Init ==
     /\ messages = [i \in Processes |-> MESSAGES]
     /\ pending = [i \in Processes |-> {}]
     /\ received = [i \in Processes |-> {}]
-    /\ sent = [i \in Processes |-> [bc |-> {}, ts |-> {}, sn |-> {}]]
+    /\ sent = {}
     /\ pc \in [Processes -> {"BCAST", ""}]
-    /\ lc = [i \in Processes |-> 0]
-
-Broadcast(message) == 
-    [i \in Processes |-> [sent[i] EXCEPT !.bc = sent[i].bc \cup {message}]]
+    /\ lclock = [i \in Processes |-> 0]
 
 UpponBCAST(self) ==
     /\ (pc[self] = "BCAST") /\ (messages[self] # {})
     /\ LET  currentMessage == CHOOSE x \in messages[self]: TRUE
-        IN  /\ sent' = Broadcast(<<self, currentMessage>>)
+        IN  /\ sent' = sent \cup {<<"BC", self, currentMessage>>}
             /\ messages' = [messages EXCEPT ![self] = messages[self] \ {currentMessage}]
-            /\ UNCHANGED <<lc, pending, pc, received>>
-
-(* <<TYPE, SOURCE, DESTINATION, MESSAGE_BODY, TIMESTAMP>> *)
+            /\ UNCHANGED <<pending, pc, received, lclock>>
+    
 ReceivedMessage(self) ==
-    /\ \E msg \in sent[self].bc:
-        /\ msg \notin pending[self]
-        /\ pending' = [pending EXCEPT ![self] = pending[self] \cup { msg }]
-        /\ sent' = [sent EXCEPT ![msg[1]].ts = sent[msg[1]].ts \cup {<<self, msg[2], lc[self]>>}]
-        /\ UNCHANGED <<received, pc, messages, lc>>
+    /\ LET msgs == {m \in sent: m[1] = "BC"}
+        IN  /\ \E msg \in msgs:
+                /\ msg \notin pending[self]
+                /\ pending' = [pending EXCEPT ![self] = pending[self] \cup { msg }]
+                /\ sent' = sent \cup {<<"TS", self, msg[2], msg[3], lclock[self]>>}
+                /\ lclock' = [lclock EXCEPT ![self] = lclock[self] + 1]
+                /\ UNCHANGED <<received, pc, messages>>
 
-MaxTSAllProcess(S) == (CHOOSE t \in S : \A s \in S : s[3] <= t[3])[3]
+MaxTS(a, b) == IF a > b THEN a ELSE b
 
-SN(message) ==
-    [i \in Processes |-> [sent[i] EXCEPT !.sn = sent[i].sn \cup {message}]]
+ReceivedTS(self) ==
+    /\ \E msg \in {m \in sent: m[1] = "TS" /\ m[3] = self}:
+        /\ msg \notin received[self]
+        /\ received' = [received EXCEPT ![self] = received[self] \cup {msg}]
+        /\ lclock' = [lclock EXCEPT ![self] = MaxTS(msg[5], lclock[self] + 1)]
+        /\ UNCHANGED <<sent, pc, messages, pending>>
 
+MaxTSAllProcess(S) == (CHOOSE t \in S : \A s \in S : s[5] <= t[5])[5]
+
+FilterStamppedMessages(self) ==
+    {m1 \in received[self]:
+        /\ m1[1] = "TS"
+        /\ Cardinality({m2 \in received[self]: m2[1] = "TS" /\ m1[3] = m2[3] /\ m1[4] = m2[4]}) = NPROCESS}
+
+\* 107 808	14 408  
 ReceivedTSFromAll(self) ==
-    /\ LET  msgs == {m1 \in sent[self].ts: \A m2 \in sent[self].ts: m1[2] = m2[2]}
-        IN  /\ Cardinality(msgs) = NPROCESS
-            /\ LET m == CHOOSE x \in msgs: TRUE
-                IN  /\ sent' = SN(<<self, m[2], MaxTSAllProcess(msgs)>>)
-                    /\ UNCHANGED <<received, pending, lc, messages, pc>>
+    /\ LET  msgs == FilterStamppedMessages(self)
+        IN  /\ \E m \in msgs:
+                    /\ sent' = sent \cup {<<"SN", self, m[4], MaxTSAllProcess(msgs)>>}
+                    /\ UNCHANGED <<lclock, messages, pc, pending, received>>
 
 ReceivedSN(self) ==
-    /\ \E msg \in sent[self].sn:
-        /\ <<msg[1], msg[2]>> \notin received[self]
-        /\ received' = [received EXCEPT ![self] = received[self] \cup {<<msg[1], msg[2]>>}]
-        /\ UNCHANGED <<sent, pending, lc, messages, pc>>
+    /\ pc[self] # "AC"
+    /\ \E msg \in {m \in sent: m[1] = "SN"}:
+        /\ received' = [received EXCEPT ![self] = received[self] \cup {<<"SN", msg[2], msg[3]>>}]
+        /\ UNCHANGED <<sent, pending, messages, lclock, pc>>
 
 \* FIX RECEIVED
 Accept(self) ==
-    /\ Cardinality(Processes \times MESSAGES) = Cardinality(received[self])
-    /\ pc' = [pc EXCEPT ![self] = "AC"]
-    /\ UNCHANGED  <<sent, pending, lc, messages, received>>
+    /\ LET msgs == {m \in received[self]: m[1] = "SN"}
+        IN  /\ Cardinality(Processes \times MESSAGES) = Cardinality(msgs)
+            /\ pc' = [pc EXCEPT ![self] = "AC"]
+            /\ UNCHANGED  <<sent, pending, messages, received, lclock>>
 
 Steps(self) ==
     \/ UpponBCAST(self)
     \/ ReceivedMessage(self)
+    \/ ReceivedTS(self)
     \/ ReceivedTSFromAll(self)
     \/ ReceivedSN(self)
     \/ Accept(self)
@@ -72,22 +80,20 @@ Steps(self) ==
 
 Next == (\E self \in Processes: Steps(self))
 
-Fairness == WF_vars(Next)
-
-Spec == Init /\ [][Next]_vars /\ Fairness
+Spec == /\ Init /\ [][Next]_vars /\ WF_vars(Next)
 
 TypeOK ==
-    /\ pc \in [ Processes -> {"BCAST", "SN", "AC", ""} ]
+    /\ pc \in [ Processes -> {"BCAST", "AC", ""} ]
+
 
 \* Properties
+M == CHOOSE m \in MESSAGES: TRUE
 
-Agreement == []((\E self \in Processes: pc[self] = "AC") => <>[](\A self \in Processes: pc[self] = "AC"))
+Agreement == []((\E self \in Processes: pc[self] = "AC") => <>(\A self \in Processes: pc[self] = "AC"))
 
-SelectedMessage == CHOOSE m \in (Processes \times MESSAGES): TRUE
+Validity == [](\E self \in Processes: (<<"BC", self, M>> \in sent => <>[](\A p \in Processes: <<"SN", self, M>> \in received[p])))
 
-Validity == []((\E self \in Processes: SelectedMessage \in sent[self].bc) => <>[](\A p \in Processes: SelectedMessage \in received[p]))
-
-Integrity == []((\E self \in Processes: SelectedMessage \in received[self]) => <>[](\A self \in Processes: Cardinality({m \in received[self]: m = SelectedMessage}) = 1))
+Integrity == [](\E self \in Processes: (<<"SN", self, M>> \in received[self] => <>[](\A p \in Processes: Cardinality({m \in received[p]: m = <<"SN", self, M>>}) = 1)))
 
 \* TotalOrder == 
 
