@@ -1,11 +1,17 @@
 ---- MODULE SkeenAlgorithm ----
+
 EXTENDS TLC, Naturals, FiniteSets, Sequences
 CONSTANTS NPROCESS, MESSAGES
-VARIABLES pc, sent, pending, received, messages, lclock
+VARIABLES pc, sent, pending, received, messages, lclock, delivering, delivered
+
 ASSUME (NPROCESS \in Nat) /\ (MESSAGES # {})
 ASSUME (NPROCESS >= 2)
 
-vars == << pc, sent, pending, received, messages, lclock>>
+  (*************************************************************************)
+  (* It is convenient to define some identifier to be the tuple of all     *)
+  (* variables.  I like to use the identifier `vars'.                      *)
+  (*************************************************************************)
+vars == << pc, sent, pending, received, messages, lclock, delivering, delivered>>
 
 Processes == 1 .. NPROCESS
 
@@ -13,87 +19,134 @@ Init ==
     /\ messages = [i \in Processes |-> MESSAGES]
     /\ pending = [i \in Processes |-> {}]
     /\ received = [i \in Processes |-> {}]
-    /\ sent = {}
-    /\ pc \in [Processes -> {"BCAST", ""}]
+    /\ delivered = [i \in Processes |-> {}]
+    /\ delivering = [i \in Processes |-> {}]
+    /\ pc \in [Processes -> {"TOCAST", "NONE"}]
+    /\ sent = [i \in Processes |-> {}]
     /\ lclock = [i \in Processes |-> 0]
 
-UpponBCAST(self) ==
-    /\ (pc[self] = "BCAST") /\ (messages[self] # {})
-    /\ LET  currentMessage == CHOOSE x \in messages[self]: TRUE
-        IN  /\ sent' = sent \cup {<<"BC", self, currentMessage>>}
-            /\ messages' = [messages EXCEPT ![self] = messages[self] \ {currentMessage}]
-            /\ UNCHANGED <<pending, pc, received, lclock>>
-    
-ReceivedMessage(self) ==
-    /\ LET msgs == {m \in sent: m[1] = "BC"}
-        IN  /\ \E msg \in msgs:
-                /\ msg \notin pending[self]
-                /\ pending' = [pending EXCEPT ![self] = pending[self] \cup { msg }]
-                /\ sent' = sent \cup {<<"TS", self, msg[2], msg[3], lclock[self]>>}
-                /\ lclock' = [lclock EXCEPT ![self] = lclock[self] + 1]
-                /\ UNCHANGED <<received, pc, messages>>
+\* If the process starts with TOCast, all messages will be transmitted to everyone.
+TOCast(self) ==
+    /\ pc[self] = "TOCAST"
+    /\ \E message \in messages[self]:
+        /\ LET sentMsg == [stage |-> 0, source |-> self, message |-> message]
+            IN  /\ sent' = [i \in Processes |-> sent[i] \cup {sentMsg}]
+                /\ messages' = [messages EXCEPT ![self] = @ \ {message}]
+                /\ UNCHANGED <<pending, received, pc, lclock, delivered, delivering>>
 
-MaxTS(a, b) == IF a > b THEN a ELSE b
+\* A process receives a new message, stamps the message with a local timestamp and sends it to the sender
+AssignTimestamp(self) ==
+    /\ \E msg \in { m \in sent[self]: m.stage = 0 }:
+        /\ lclock' = [lclock EXCEPT ![self] = @ + 1]
+        /\ pending' = [pending EXCEPT ![self] = @ \cup {[
+            sender |-> msg.source,
+            message |-> msg.message,
+            timestamp |-> lclock[self]]}]
+        /\ sent' = [sent EXCEPT ![msg.source] = @ \cup {[
+            stage |-> 1,
+            source |-> self,
+            message |-> msg.message,
+            timestamp |-> lclock[self]]}]
+        /\ UNCHANGED <<messages, received, pc, delivered, delivering>>
 
-ReceivedTS(self) ==
-    /\ \E msg \in {m \in sent: m[1] = "TS" /\ m[3] = self}:
-        /\ msg \notin received[self]
-        /\ received' = [received EXCEPT ![self] = received[self] \cup {msg}]
-        /\ lclock' = [lclock EXCEPT ![self] = MaxTS(msg[5], lclock[self] + 1)]
-        /\ UNCHANGED <<sent, pc, messages, pending>>
 
-MaxTSAllProcess(S) == (CHOOSE t \in S : \A s \in S : s[5] <= t[5])[5]
+MaxTimestamp(a, b) == IF a > b THEN a ELSE b
 
-FilterStamppedMessages(self) ==
-    {m1 \in received[self]:
-        /\ m1[1] = "TS"
-        /\ Cardinality({m2 \in received[self]: m2[1] = "TS" /\ m1[3] = m2[3] /\ m1[4] = m2[4]}) = NPROCESS}
+\* A process receives a stamped message and updates logical clock
+ReceivedStage1Message(self) ==
+    /\ \E msg \in {m \in sent[self]: m.stage = 1}:
+        /\ received' = [received EXCEPT ![self] = @ \cup {[
+            stage |-> 1,
+            source |-> msg.source,
+            messages |-> msg.message,
+            timestamp |->  msg.timestamp]}]
+        /\ lclock' = [lclock EXCEPT ![self] = MaxTimestamp(msg.timestamp, lclock[self]) + 1]
+        /\ UNCHANGED <<sent, pc, messages, pending, delivered, delivering>>
+        
+CountReceivedStage1Message(self, msg) ==
+    Cardinality({m \in received[self]: m.stage = 1 /\ msg.message = m.message})
+   
+FilterReceivedStage1Message(self) ==
+    {msg \in received[self]: msg.stage = 1 /\ CountReceivedStage1Message(self, msg) = NPROCESS}
 
-\* 107 808	14 408  
-ReceivedTSFromAll(self) ==
-    /\ LET  msgs == FilterStamppedMessages(self)
-        IN  /\ \E m \in msgs:
-                    /\ sent' = sent \cup {<<"SN", self, m[4], MaxTSAllProcess(msgs)>>}
-                    /\ UNCHANGED <<lclock, messages, pc, pending, received>>
+SeqNumber(S) == (CHOOSE t \in S : \A s \in S : s.timestamp <= t.timestamp).timestamp
 
-ReceivedSN(self) ==
-    /\ pc[self] # "AC"
-    /\ \E msg \in {m \in sent: m[1] = "SN"}:
-        /\ received' = [received EXCEPT ![self] = received[self] \cup {<<"SN", msg[2], msg[3]>>}]
-        /\ UNCHANGED <<sent, pending, messages, lclock, pc>>
+ComputeSeqNumber(self) == 
+    /\ LET receivedMessages == FilterReceivedStage1Message(self)
+        IN  /\ \E msg \in receivedMessages:
+                /\ sent' = [i \in Processes |-> sent[i] \cup {[
+                    stage |-> 2,
+                    source |-> self,
+                    message |-> msg.message,
+                    sn |-> SeqNumber(receivedMessages)]}]
+                /\ UNCHANGED <<lclock, messages, pc, pending, received, delivered, delivering>>
 
-\* FIX RECEIVED
-Accept(self) ==
-    /\ LET msgs == {m \in received[self]: m[1] = "SN"}
-        IN  /\ Cardinality(Processes \times MESSAGES) = Cardinality(msgs)
-            /\ pc' = [pc EXCEPT ![self] = "AC"]
-            /\ UNCHANGED  <<sent, pending, messages, received, lclock>>
+AssignSeqNumber(self) ==
+    /\ \E msg \in {m \in sent[self]: m.stage = 2}:
+        /\ pending' = pending \ {}
+        /\ delivering' = [delivering EXCEPT ![self] = {[
+            sender |-> msg.source,
+            message |-> msg.message,
+            timestamp |-> msg.sn]}]
+        /\ UNCHANGED <<sent, received, pc, delivered>>
+
+
+DoDeliver(self) ==
+    /\ \E msg \in {m \in delivering: \A m1 \in pending \union delivering: m.timestamp <= m1.timestamp}:
+        /\ delivering' = [delivering EXCEPT ![self] = @ \ msg]
+        /\ delivered = [delivered EXCEPT ![self] = @ \cup {msg.message}]
+        /\ UNCHANGED <<sent, pc, pending, received>>
+
 
 Steps(self) ==
-    \/ UpponBCAST(self)
-    \/ ReceivedMessage(self)
-    \/ ReceivedTS(self)
-    \/ ReceivedTSFromAll(self)
-    \/ ReceivedSN(self)
-    \/ Accept(self)
+    \/ TOCast(self)
+    \/ AssignTimestamp(self)
+    \/ ReceivedStage1Message(self)
+    \/ ComputeSeqNumber(self)
+    \/ AssignSeqNumber(self)
+    \/ DoDeliver(self)
     \/ UNCHANGED vars
 
-Next == (\E self \in Processes: Steps(self))
+
+
+Next == (\E p \in Processes: Steps(p))
 
 Spec == /\ Init /\ [][Next]_vars /\ WF_vars(Next)
 
 TypeOK ==
-    /\ pc \in [ Processes -> {"BCAST", "AC", ""} ]
-
+    /\ pc \in [Processes -> {"TOCAST", "NONE"}]
 
 \* Properties
 M == CHOOSE m \in MESSAGES: TRUE
 
-Agreement == []((\E self \in Processes: pc[self] = "AC") => <>(\A self \in Processes: pc[self] = "AC"))
+(***********************************************************************)
+(*                  *)
+(***********************************************************************)
 
-Validity == [](\E self \in Processes: (<<"BC", self, M>> \in sent => <>[](\A p \in Processes: <<"SN", self, M>> \in received[p])))
+\* FIX
+\* Agreement == <>[](\A self \in Processes: Cardinality(Processes \times MESSAGES) = Cardinality({received[self]})))
 
+(***********************************************************************)
+(* Agreement: If a correct process TO-delivers a message m, then every *)
+(* correct process in Dst(m) eventually TO-delivers m.                 *)
+(***********************************************************************)
+
+(******************************************************************)
+(* Validity: If a correct process TO-multicasts a message m, then *)
+(* every correct process in Dst(m) eventually TO-delivers m.      *)
+(******************************************************************)
+
+Validity == [](\A self \in Processes: (<<"BC", self, M>> \in sent => <>[](\A p \in Processes: <<"SN", self, M>> \in received[p])))
+\* EXPERIMENT
+
+(*************************************************************************************)
+(* Integrity: For any message m, every correct process p TO-delivers m at most once, *)
+(* and only if p ∈ Dst(m) and m was TO-multicast by some process Orig(m).            *)
+(*************************************************************************************)
 Integrity == [](\E self \in Processes: (<<"SN", self, M>> \in received[self] => <>[](\A p \in Processes: Cardinality({m \in received[p]: m = <<"SN", self, M>>}) = 1)))
+
+\* Pairwise total order: If two correct processes p and q TO-deliver messages m and m1, then p TO-delivers m before m1 if and only if q TO-delivers m before m1.
+\* TotalOrder == [](\E self \in )
 
 \* TotalOrder == 
 
